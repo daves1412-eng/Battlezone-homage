@@ -7,22 +7,11 @@
 <style>
   html,body{margin:0;padding:0;background:#000;height:100%;overflow:hidden;touch-action:none;
     -webkit-user-select:none;user-select:none}
-  #c{display:block;width:100vw;height:100vh;background:#000;cursor:crosshair}
-  .tbtn{position:fixed;bottom:4vh;width:17vw;height:17vw;max-width:110px;max-height:110px;
-    border:2px solid rgba(80,255,80,.55);border-radius:14px;color:rgba(120,255,120,.8);
-    background:rgba(0,40,0,.25);font:700 22px monospace;display:none;align-items:center;
-    justify-content:center;z-index:5}
-  .tbtn:active{background:rgba(0,120,0,.35)}
-  #bl{left:3vw}#br{left:23vw}#bf{right:23vw}#bb{right:3vw;bottom:24vh}
-  #bfire{right:3vw;border-color:rgba(255,120,80,.6);color:rgba(255,150,110,.9)}
-  @media (pointer:coarse){.tbtn{display:flex}}
+  #c{display:block;width:100vw;height:100vh;height:100dvh;background:#000;cursor:crosshair;touch-action:none}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="tbtn" id="bl">&#8634;</div><div class="tbtn" id="br">&#8635;</div>
-<div class="tbtn" id="bf">&#9650;</div><div class="tbtn" id="bb">&#9660;</div>
-<div class="tbtn" id="bfire">FIRE</div>
 <script id="game">
 "use strict";
 /* ============================================================
@@ -216,7 +205,7 @@ const G = {
   horizon: makeHorizon(0x5EED),
   shake:0,
   kills:0,
-  input:{f:false,b:false,l:false,r:false,fire:false},
+  input:{f:false,b:false,l:false,r:false,fire:false,axisTurn:0,axisDrive:0},
   fireLatch:false,
 };
 
@@ -356,6 +345,8 @@ function newGame(){
   G.px=600; G.pz=600; G.heading=0; G.shell=null; G.eshells=[]; G.frags=[];
   G.enemy=null; G.saucer=null; G.respawnT=0.8; G.saucerT=12+Math.random()*14;
   G.kills=0; G.blockedT=0;
+  G.input.f=G.input.b=G.input.l=G.input.r=G.input.fire=false; G.fireLatch=false;
+  G.input.axisTurn=0; G.input.axisDrive=0;
   sfx.startEngine();
 }
 
@@ -378,12 +369,12 @@ function step(dt){
   }
 
   /* --- player movement (pivot like twin tracks) --- */
-  const I=G.input;
-  G.turn=(I.l?1:0)-(I.r?1:0);
-  G.vel=(I.f?1:0)-(I.b?1:0);
+  const I=G.input, c1=v=>Math.max(-1,Math.min(1,v));
+  G.turn=c1((I.r?1:0)-(I.l?1:0)+I.axisTurn);
+  G.vel =c1((I.f?1:0)-(I.b?1:0)+I.axisDrive);
   G.heading=wrapA(G.heading+G.turn*CFG.playerTurn*dt);
   if(G.vel!==0){
-    const sp=CFG.playerSpeed*(G.vel>0?1:0.6)*G.vel;
+    const sp=CFG.playerSpeed*G.vel;  // symmetric fwd/rev, as the twin-stick original
     const nx=G.px+sin(G.heading)*sp*dt, nz=G.pz+cos(G.heading)*sp*dt;
     let blocked=hitsObstacle(nx,nz,CFG.playerRadius);
     if(!blocked && G.enemy && G.enemy.type!=="missile" &&
@@ -637,6 +628,22 @@ function render(){
       for(const p of line)ctx.lineTo(p[0],p[1]);}
     ctx.stroke();
   }
+  /* touch roll indicators: faint anchor ring + deflection bar at each thumb */
+  if(G.touchUI&&(G.touchUI.turn||G.touchUI.drive)){
+    const dpr=W/innerWidth;
+    ctx.strokeStyle="rgba(51,255,68,0.4)"; ctx.shadowBlur=0; ctx.lineWidth=Math.max(1.4,H/520);
+    for(const k of ["turn","drive"]){
+      const t=G.touchUI[k]; if(!t)continue;
+      const x=t.x*dpr, y=t.y*dpr, r=26*dpr;
+      ctx.beginPath(); ctx.arc(x,y,r,0,TAU); ctx.stroke();
+      ctx.beginPath();
+      if(k==="turn"){ const d=Math.max(-48,Math.min(48,t.dx))*dpr;
+        ctx.moveTo(x,y); ctx.lineTo(x+d,y); }
+      else{ const d=Math.max(-48,Math.min(48,t.dy))*dpr;
+        ctx.moveTo(x,y); ctx.lineTo(x,y+d); }
+      ctx.stroke();
+    }
+  }
   ctx.shadowBlur=0;
 }
 
@@ -749,7 +756,10 @@ function drawTitles(){
     vtext("A WIREFRAME TANK COMBAT TRIBUTE", W/2, H*0.37, 15*u, "center");
     if(Math.floor(G.time*1.6)%2===0)
       vtext("PRESS ENTER OR TAP TO START", W/2, H*0.55, 20*u, "center");
-    vtext("MOVE: W/S OR ARROWS   PIVOT: A/D   FIRE: SPACE / CLICK", W/2, H*0.86, 12*u, "center");
+    if(typeof matchMedia==="function"&&matchMedia("(pointer:coarse)").matches)
+      vtext("LEFT THUMB ROLL: PIVOT   RIGHT THUMB ROLL: DRIVE   TAP: FIRE", W/2, H*0.86, 12*u, "center");
+    else
+      vtext("MOVE: W/S OR ARROWS   PIVOT: A/D   FIRE: SPACE / CLICK", W/2, H*0.86, 12*u, "center");
     vtext("TANK 1000   MISSILE 2000   SUPERTANK 3000   SAUCER 5000", W/2, H*0.91, 12*u, "center");
   }
   if(G.mode==="GAMEOVER"){
@@ -831,12 +841,16 @@ const sfx=(()=> {
 if(isBrowser){
   cv=document.getElementById("c");ctx=cv.getContext("2d");
   function resize(){
+    const vp=window.visualViewport;
+    const vw=vp?vp.width:innerWidth, vh=vp?vp.height:innerHeight;
     const dpr=Math.min(window.devicePixelRatio||1,2);
-    W=cv.width=Math.floor(innerWidth*dpr); H=cv.height=Math.floor(innerHeight*dpr);
-    cv.style.width=innerWidth+"px";cv.style.height=innerHeight+"px";
+    W=cv.width=Math.floor(vw*dpr); H=cv.height=Math.floor(vh*dpr);
+    cv.style.width=vw+"px";cv.style.height=vh+"px";
     G.cracks=null;
   }
-  addEventListener("resize",resize);resize();
+  addEventListener("resize",resize);
+  if(window.visualViewport)visualViewport.addEventListener("resize",resize);
+  resize();
 
   const KEY={ArrowUp:"f",KeyW:"f",ArrowDown:"b",KeyS:"b",
              ArrowLeft:"l",KeyA:"l",ArrowRight:"r",KeyD:"r",Space:"fire"};
@@ -846,20 +860,54 @@ if(isBrowser){
     const k=KEY[e.code]; if(k){G.input[k]=true;e.preventDefault();}
   });
   addEventListener("keyup",e=>{const k=KEY[e.code];if(k)G.input[k]=false;});
+  /* mouse / pen: click to fire, as before */
   cv.addEventListener("pointerdown",e=>{
     sfx.unlock();
     if(G.mode!=="PLAYING"&&G.mode!=="DYING"){newGame();return;}
-    G.input.fire=true;
+    if(e.pointerType!=="touch") G.input.fire=true;
   });
-  cv.addEventListener("pointerup",()=>{G.input.fire=false;});
-  // touch buttons
-  for(const [id,k] of [["bl","l"],["br","r"],["bf","f"],["bb","b"],["bfire","fire"]]){
-    const el=document.getElementById(id);
-    el.addEventListener("pointerdown",e=>{e.preventDefault();sfx.unlock();
-      if(G.mode!=="PLAYING"&&G.mode!=="DYING"){newGame();return;} G.input[k]=true;});
-    el.addEventListener("pointerup",e=>{e.preventDefault();G.input[k]=false;});
-    el.addEventListener("pointerleave",()=>{G.input[k]=false;});
-  }
+  cv.addEventListener("pointerup",e=>{ if(e.pointerType!=="touch") G.input.fire=false; });
+
+  /* touch: roll-zones. Left half: roll thumb left/right to pivot.
+     Right half: roll thumb up/down to drive. Quick tap anywhere: fire.
+     Analog: deflection past a small deadzone scales speed up to full. */
+  const ROLL={gain:48, dead:8};      // px to full deflection / ignored wobble
+  const tp={};                        // pointerId -> {x0,y0,t0,moved,role}
+  let turnId=null, driveId=null;
+  G.touchUI={turn:null, drive:null};  // for on-screen indicators
+  const dz=v=>Math.abs(v)<ROLL.dead?0:v-Math.sign(v)*ROLL.dead;
+  const c1=v=>Math.max(-1,Math.min(1,v));
+
+  cv.addEventListener("pointerdown",e=>{
+    if(e.pointerType!=="touch")return;
+    e.preventDefault(); cv.setPointerCapture(e.pointerId);
+    if(G.mode!=="PLAYING"&&G.mode!=="DYING")return; // newGame handled above
+    let role="tap";
+    if(e.clientX<innerWidth/2 && turnId===null){ role="turn"; turnId=e.pointerId; }
+    else if(e.clientX>=innerWidth/2 && driveId===null){ role="drive"; driveId=e.pointerId; }
+    tp[e.pointerId]={x0:e.clientX,y0:e.clientY,t0:performance.now(),moved:false,role};
+    if(role!=="tap") G.touchUI[role]={x:e.clientX,y:e.clientY,dx:0,dy:0};
+  });
+  cv.addEventListener("pointermove",e=>{
+    const t=tp[e.pointerId]; if(!t)return;
+    const dx=e.clientX-t.x0, dy=e.clientY-t.y0;
+    if(dx*dx+dy*dy>ROLL.dead*ROLL.dead*2) t.moved=true;
+    if(t.role==="turn"){ G.input.axisTurn=c1(dz(dx)/ROLL.gain);
+      G.touchUI.turn={x:t.x0,y:t.y0,dx,dy}; }
+    else if(t.role==="drive"){ G.input.axisDrive=c1(-dz(dy)/ROLL.gain);
+      G.touchUI.drive={x:t.x0,y:t.y0,dx,dy}; }
+  });
+  const endTouch=e=>{
+    const t=tp[e.pointerId]; if(!t)return;
+    if(!t.moved && performance.now()-t.t0<260){      // a tap: fire
+      sfx.unlock(); G.input.fire=true; setTimeout(()=>G.input.fire=false,60);
+    }
+    if(t.role==="turn"){ turnId=null; G.input.axisTurn=0; G.touchUI.turn=null; }
+    if(t.role==="drive"){ driveId=null; G.input.axisDrive=0; G.touchUI.drive=null; }
+    delete tp[e.pointerId];
+  };
+  cv.addEventListener("pointerup",endTouch);
+  cv.addEventListener("pointercancel",endTouch);
 
   let last=performance.now();
   function loop(now){
