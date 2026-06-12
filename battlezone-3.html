@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>BATTLE ZONE — wireframe tank combat (tribute)</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;height:100%;overflow:hidden;touch-action:none;
+    -webkit-user-select:none;user-select:none}
+  #c{display:block;width:100vw;height:100vh;background:#000;cursor:crosshair}
+  .tbtn{position:fixed;bottom:4vh;width:17vw;height:17vw;max-width:110px;max-height:110px;
+    border:2px solid rgba(80,255,80,.55);border-radius:14px;color:rgba(120,255,120,.8);
+    background:rgba(0,40,0,.25);font:700 22px monospace;display:none;align-items:center;
+    justify-content:center;z-index:5}
+  .tbtn:active{background:rgba(0,120,0,.35)}
+  #bl{left:3vw}#br{left:23vw}#bf{right:23vw}#bb{right:3vw;bottom:24vh}
+  #bfire{right:3vw;border-color:rgba(255,120,80,.6);color:rgba(255,150,110,.9)}
+  @media (pointer:coarse){.tbtn{display:flex}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="tbtn" id="bl">&#8634;</div><div class="tbtn" id="br">&#8635;</div>
+<div class="tbtn" id="bf">&#9650;</div><div class="tbtn" id="bb">&#9660;</div>
+<div class="tbtn" id="bfire">FIRE</div>
+<script id="game">
+"use strict";
+/* ============================================================
+   BATTLE ZONE — an original, from-scratch tribute to the 1980
+   vector wireframe tank-combat arcade game. All code & models
+   written for this project. Green phosphor vectors on black.
+   ============================================================ */
+
+const CFG = {
+  eyeH: 4.5,            // camera height above plain
+  fov: 1.5,             // projection focal scale
+  nearZ: 0.5,
+  farZ: 580,
+  tile: 1200,           // obstacle field repeats every tile
+  radarRange: 320,
+  radarSweepRate: 1.6,  // rad/s
+
+  playerSpeed: 26,      // units/s forward
+  playerTurn: 0.95,     // rad/s pivot
+  shellSpeed: 240,
+  shellRange: 460,
+  playerRadius: 7,
+
+  tankSpeed: 13,
+  superSpeed: 30,
+  tankTurn: 0.7,
+  superTurn: 1.25,
+  enemyFireRange: 300,
+  enemyAimCone: 0.045,  // radians alignment needed to fire
+  enemyShellSpeed: 170,
+  enemyReload: 2.6,
+
+  missileSpeed: 78,
+  missileZig: 28,       // lateral zigzag amplitude
+  saucerSpeed: 16,
+
+  spawnMin: 240, spawnMax: 330,
+  respawnDelay: 1.6,
+
+  scores: { tank:1000, supertank:3000, missile:2000, saucer:5000 },
+  bonusLives: [15000, 100000],
+  startLives: 3
+};
+
+/* ---------------- vector & projection helpers ---------------- */
+const sin=Math.sin, cos=Math.cos, PI=Math.PI, TAU=PI*2;
+const wrapA = a => { a%=TAU; if(a>PI)a-=TAU; if(a<-PI)a+=TAU; return a; };
+const dist2 = (ax,az,bx,bz)=>{const dx=ax-bx,dz=az-bz;return dx*dx+dz*dz;};
+
+// world -> camera space (right=x, up=y, depth=z) for camera at (px,pz,eyeH) heading h
+function toCam(wx,wy,wz, px,pz,h){
+  const dx=wx-px, dz=wz-pz, s=sin(h), c=cos(h);
+  return [ dx*c - dz*s, wy-CFG.eyeH, dx*s + dz*c ];
+}
+// clip segment to z>=near; returns null or [p1,p2] in cam space
+function clipSeg(a,b,near){
+  let [ax,ay,az]=a,[bx,by,bz]=b;
+  if(az<near && bz<near) return null;
+  if(az<near||bz<near){
+    const t=(near-az)/(bz-az), ix=ax+(bx-ax)*t, iy=ay+(by-ay)*t;
+    if(az<near){ax=ix;ay=iy;az=near;} else {bx=ix;by=iy;bz=near;}
+  }
+  return [[ax,ay,az],[bx,by,bz]];
+}
+
+/* ---------------- wireframe models ---------------- */
+// model = {v:[[x,y,z]..], e:[[i,j]..], r: collision radius}
+function boxM(w,h,d,y0=0){
+  const x=w/2,z=d/2;
+  return {v:[[-x,y0,-z],[x,y0,-z],[x,y0,z],[-x,y0,z],
+             [-x,y0+h,-z],[x,y0+h,-z],[x,y0+h,z],[-x,y0+h,z]],
+          e:[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]]};
+}
+const MODELS = {};
+// Enemy tank: low slanted hull, turret, long barrel (+z = facing)
+MODELS.tank = (()=> {
+  const v=[ //hull base
+    [-7,0,-9],[7,0,-9],[7,0,9],[-7,0,9],
+    [-5.5,3.4,-6.5],[5.5,3.4,-6.5],[5.5,3.4,7],[-5.5,3.4,7], //hull top
+    [-3,3.4,-4],[3,3.4,-4],[3,3.4,2.5],[-3,3.4,2.5],          //turret base
+    [-2.2,5.6,-3.2],[2.2,5.6,-3.2],[2.2,5.6,1.6],[-2.2,5.6,1.6],//turret top
+    [-0.5,4.4,1.6],[0.5,4.4,1.6],[0.5,4.4,11],[-0.5,4.4,11]   //barrel
+  ];
+  const e=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7],
+    [8,9],[9,10],[10,11],[11,8],[12,13],[13,14],[14,15],[15,12],[8,12],[9,13],[10,14],[11,15],
+    [16,17],[17,18],[18,19],[19,16]];
+  return {v,e,r:9};
+})();
+// Supertank: sleeker wedge with angular turret
+MODELS.supertank = (()=> {
+  const v=[
+    [-6,0,-10],[6,0,-10],[6,0,10],[-6,0,10],
+    [-4,3,-5],[4,3,-5],[0,3,9],            // wedge top (nose point)
+    [-2.4,3,-4],[2.4,3,-4],[0,5.4,-1],     // turret pyramid
+    [-0.45,3.8,0],[0.45,3.8,0],[0.45,3.8,12],[-0.45,3.8,12] // barrel
+  ];
+  const e=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,4],[0,4],[1,5],[2,6],[3,6],
+    [7,8],[8,9],[9,7],[10,11],[11,12],[12,13],[13,10]];
+  return {v,e,r:9};
+})();
+// Missile: finned dart, flies nose-first (+z)
+MODELS.missile = (()=> {
+  const v=[[0,3,9],            //nose
+    [-1.6,1.8,2],[1.6,1.8,2],[1.6,4.2,2],[-1.6,4.2,2],       //body front ring
+    [-1.6,1.8,-7],[1.6,1.8,-7],[1.6,4.2,-7],[-1.6,4.2,-7],   //body rear ring
+    [-6,3,-7],[6,3,-7],[0,8,-7],[0,0.2,-7]];                 //fins
+  const e=[[0,1],[0,2],[0,3],[0,4],[1,2],[2,3],[3,4],[4,1],
+    [5,6],[6,7],[7,8],[8,5],[1,5],[2,6],[3,7],[4,8],
+    [9,5],[9,8],[10,6],[10,7],[11,7],[11,8],[12,5],[12,6]];
+  return {v,e,r:6};
+})();
+// Saucer: two stacked rims + dome
+MODELS.saucer = (()=> {
+  const v=[],e=[],N=8;
+  for(let i=0;i<N;i++){const a=i/N*TAU;v.push([cos(a)*9,3.2,sin(a)*9]);}       //mid rim
+  for(let i=0;i<N;i++){const a=i/N*TAU;v.push([cos(a)*4.5,5.8,sin(a)*4.5]);}   //top rim
+  for(let i=0;i<N;i++){const a=i/N*TAU;v.push([cos(a)*4.5,1.0,sin(a)*4.5]);}   //bottom rim
+  for(let i=0;i<N;i++){
+    e.push([i,(i+1)%N],[N+i,N+(i+1)%N],[2*N+i,2*N+(i+1)%N],[i,N+i],[i,2*N+i]);
+  }
+  return {v,e,r:9};
+})();
+// Obstacles
+MODELS.pyramid = (()=>{const s=11,h=14;
+  return {v:[[-s,0,-s],[s,0,-s],[s,0,s],[-s,0,s],[0,h,0]],
+          e:[[0,1],[1,2],[2,3],[3,0],[0,4],[1,4],[2,4],[3,4]], r:11};})();
+MODELS.shortBox = Object.assign(boxM(16,9,16),{r:11});
+MODELS.tallBox  = Object.assign(boxM(13,22,13),{r:9});
+// projectile tracer (small vertical diamond)
+MODELS.shell = {v:[[0,1.4,1.6],[0,2.6,0],[0,1.4,-1.6],[0,0.2,0]],
+                e:[[0,1],[1,2],[2,3],[3,0]], r:1.5};
+
+/* ---------------- obstacle field (repeats per tile) ---------------- */
+function makeObstacles(seed){
+  let s=seed>>>0; const rnd=()=>((s=(s*1103515245+12345)>>>0)/4294967296);
+  const types=["pyramid","shortBox","tallBox","pyramid","shortBox"];
+  const obs=[];
+  for(let i=0;i<18;i++){
+    obs.push({x:rnd()*CFG.tile, z:rnd()*CFG.tile,
+              type:types[(rnd()*types.length)|0], rot:rnd()*TAU});
+  }
+  // keep a clear bubble at tile-relative player start
+  return obs.filter(o=>dist2(o.x,o.z,600,600)>90*90);
+}
+// iterate obstacles near a world point (handles tiling)
+function nearbyObstacles(obs, x, z, range, fn){
+  const T=CFG.tile, bx=Math.floor(x/T), bz=Math.floor(z/T), r2=range*range;
+  for(let i=-1;i<=1;i++)for(let j=-1;j<=1;j++){
+    const ox=(bx+i)*T, oz=(bz+j)*T;
+    for(const o of obs){
+      const wx=ox+o.x, wz=oz+o.z;
+      if(dist2(wx,wz,x,z)<=r2) fn(wx,wz,o);
+    }
+  }
+}
+
+/* ---------------- mountain horizon profile ---------------- */
+function makeHorizon(seed){
+  let s=seed>>>0; const rnd=()=>((s=(s*48271)%2147483647)/2147483647);
+  const N=96, pts=new Float32Array(N);
+  for(let i=0;i<N;i++){
+    const jag=rnd();
+    pts[i]= (i%2? 8+jag*30 : jag*9);          // alternating peaks & valleys
+  }
+  // carve the volcano: a tall peak with a crater notch at index VI
+  const VI=24;
+  pts[(VI-2+N)%N]=6; pts[(VI-1+N)%N]=46; pts[VI]=38; pts[(VI+1)%N]=48; pts[(VI+2)%N]=5;
+  return {pts,N,volcanoIdx:VI};
+}
+
+/* ====================================================================
+   GAME STATE
+==================================================================== */
+const G = {
+  mode:"ATTRACT",         // ATTRACT | PLAYING | DYING | GAMEOVER
+  score:0, hiscore:0, lives:0, bonusGiven:[],
+  px:600,pz:600,heading:0,
+  vel:0, turn:0,          // current input intents (-1..1)
+  blockedT:0,             // "MOTION BLOCKED" message timer
+  shell:null,             // player shell {x,z,h,dist}
+  eshells:[],             // enemy shells
+  enemy:null,             // current main enemy
+  saucer:null,
+  respawnT:1.0,
+  saucerT:18,
+  missileCue:0,           // pending missile spawn flag/timer
+  frags:[],               // explosion fragments
+  deathT:0, cracks:null, deathFlash:0,
+  sweep:0, time:0, msgT:0,
+  obstacles: makeObstacles(0xB47713E),
+  horizon: makeHorizon(0x5EED),
+  shake:0,
+  kills:0,
+  input:{f:false,b:false,l:false,r:false,fire:false},
+  fireLatch:false,
+};
+
+/* pick the heading with the most open foreground (used for attract camera) */
+function clearHeading(){
+  let best=0, bestD=-1;
+  for(let i=0;i<24;i++){
+    const h=i/24*TAU; let minD=1e9;
+    nearbyObstacles(G.obstacles,G.px,G.pz,300,(wx,wz)=>{
+      const a=wrapA(Math.atan2(wx-G.px,wz-G.pz)-h);
+      if(Math.abs(a)<0.55){ const d=Math.sqrt(dist2(wx,wz,G.px,G.pz)); if(d<minD)minD=d; }
+    });
+    if(minD>bestD){bestD=minD;best=h;}
+  }
+  return best;
+}
+G.heading=clearHeading();
+
+function level(){ // difficulty tier from score (used for speed/accuracy/mix)
+  const s=G.score;
+  return s<2000?0 : s<6000?1 : s<12000?2 : s<25000?3 : s<50000?4 : 5;
+}
+function enemyParams(){
+  const L=level();
+  return {
+    speedMul: 1+L*0.13,
+    reload: Math.max(1.1, CFG.enemyReload-0.28*L),
+    aimErr: Math.max(0.004, 0.05-0.009*L),     // radians of aim error
+    superChance: L<1?0 : L<2?0.25 : L<3?0.45 : 0.65,
+    missileChance: L<1?0 : 0.18+0.05*L,
+  };
+}
+
+/* ---------------- spawning ---------------- */
+function spawnEnemy(){
+  const p=enemyParams();
+  let type="tank";
+  if(p.missileChance>0 && Math.random()<p.missileChance) type="missile";
+  else if(Math.random()<p.superChance) type="supertank";
+  let ex,ez;
+  for(let tries=0;tries<12;tries++){
+    const ang=Math.random()*TAU,
+          d=CFG.spawnMin+Math.random()*(CFG.spawnMax-CFG.spawnMin);
+    ex=G.px+sin(ang)*d; ez=G.pz+cos(ang)*d;
+    if(!hitsObstacle(ex,ez,12)) break;
+  }
+  const e={type, x:ex, z:ez,
+           h:0, reload:1.4+Math.random(), zig:Math.random()*TAU,
+           turnDir:Math.random()<0.5?-1:1, repos:0};
+  e.h=Math.atan2(G.px-e.x, G.pz-e.z);          // face player
+  if(type==="missile"){ e.y=18; }              // missiles come in high then drop
+  G.enemy=e;
+}
+function spawnSaucer(){
+  const ang=Math.random()*TAU, d=200+Math.random()*120;
+  G.saucer={x:G.px+sin(ang)*d, z:G.pz+cos(ang)*d, h:Math.random()*TAU, wob:0, turnT:0};
+}
+
+/* ---------------- collision ---------------- */
+function hitsObstacle(x,z,r){
+  let hit=false;
+  nearbyObstacles(G.obstacles,x,z,r+14,(wx,wz,o)=>{
+    if(!hit && dist2(wx,wz,x,z) < (r+MODELS[o.type].r)*(r+MODELS[o.type].r)) hit=true;
+  });
+  return hit;
+}
+
+/* ---------------- explosions ---------------- */
+function explodeAt(x,z,model,h){
+  // throw the model's edges outward as tumbling fragments
+  const s=sin(h),c=cos(h);
+  for(const [i,j] of model.e){
+    const a=model.v[i], b=model.v[j];
+    const mx=(a[0]+b[0])/2, my=(a[1]+b[1])/2, mz=(a[2]+b[2])/2;
+    G.frags.push({
+      x:x+(mx*c+mz*s), y:my, z:z+(-mx*s+mz*c),
+      vx:(Math.random()-0.5)*46, vy:14+Math.random()*30, vz:(Math.random()-0.5)*46,
+      ax:a.slice(), bx:b.slice(), rot:Math.random()*TAU, rv:(Math.random()-0.5)*9,
+      t:1.7+Math.random()*0.7
+    });
+  }
+}
+function killEnemy(viaShell){
+  const e=G.enemy;
+  explodeAt(e.x,e.z,MODELS[e.type],e.h);
+  addScore(CFG.scores[e.type]);
+  G.enemy=null; G.respawnT=CFG.respawnDelay; G.kills++;
+  sfx.explosion();
+}
+function addScore(n){
+  G.score+=n;
+  for(const t of CFG.bonusLives){
+    if(G.score>=t && !G.bonusGiven.includes(t)){
+      G.bonusGiven.push(t); G.lives++; sfx.bonus();
+    }
+  }
+  if(G.score>G.hiscore) G.hiscore=G.score;
+}
+
+/* ---------------- player death ---------------- */
+function makeCracks(W,H){
+  const cx=W/2+(Math.random()-0.5)*W*0.3, cy=H/2+(Math.random()-0.5)*H*0.3, lines=[];
+  for(let i=0;i<11;i++){
+    const a=Math.random()*TAU; let x=cx,y=cy,pts=[[x,y]];
+    for(let k=0;k<7;k++){
+      const step=30+Math.random()*70;
+      x+=cos(a+(Math.random()-0.5)*0.9)*step; y+=sin(a+(Math.random()-0.5)*0.9)*step;
+      pts.push([x,y]);
+    }
+    lines.push(pts);
+  }
+  return lines;
+}
+function playerHit(){
+  if(G.mode!=="PLAYING") return;
+  G.mode="DYING"; G.deathT=2.4; G.deathFlash=1; G.cracks=null; // cracks built at render size
+  G.eshells.length=0;
+  if(G.enemy && G.enemy.type==="missile"){ G.enemy=null; G.respawnT=CFG.respawnDelay; }
+  sfx.playerDeath();
+}
+function afterDeath(){
+  G.lives--;
+  if(G.lives<=0){ G.mode="GAMEOVER"; G.msgT=0; sfx.stopEngine(); }
+  else {
+    G.mode="PLAYING";
+    // nudge enemy away if it's on top of us
+    if(G.enemy && dist2(G.enemy.x,G.enemy.z,G.px,G.pz)<140*140){
+      const a=Math.atan2(G.enemy.x-G.px,G.enemy.z-G.pz);
+      G.enemy.x=G.px+sin(a)*240; G.enemy.z=G.pz+cos(a)*240;
+    }
+  }
+}
+
+/* ---------------- new game ---------------- */
+function newGame(){
+  G.mode="PLAYING"; G.score=0; G.lives=CFG.startLives; G.bonusGiven=[];
+  G.px=600; G.pz=600; G.heading=0; G.shell=null; G.eshells=[]; G.frags=[];
+  G.enemy=null; G.saucer=null; G.respawnT=0.8; G.saucerT=12+Math.random()*14;
+  G.kills=0; G.blockedT=0;
+  G.input.f=G.input.b=G.input.l=G.input.r=G.input.fire=false; G.fireLatch=false;
+  sfx.startEngine();
+}
+
+/* ====================================================================
+   UPDATE
+==================================================================== */
+function step(dt){
+  G.time+=dt; G.sweep=(G.sweep+CFG.radarSweepRate*dt)%TAU;
+  if(G.blockedT>0)G.blockedT-=dt;
+  updateFrags(dt);
+
+  if(G.mode==="DYING"){
+    G.deathT-=dt; G.deathFlash=Math.max(0,G.deathFlash-dt*2.2);
+    if(G.deathT<=0) afterDeath();
+    return;
+  }
+  if(G.mode!=="PLAYING"){ // attract: slow pan
+    G.heading=wrapA(G.heading+dt*0.07);
+    return;
+  }
+
+  /* --- player movement (pivot like twin tracks) --- */
+  const I=G.input;
+  G.turn=(I.r?1:0)-(I.l?1:0);
+  G.vel=(I.f?1:0)-(I.b?1:0);
+  G.heading=wrapA(G.heading+G.turn*CFG.playerTurn*dt);
+  if(G.vel!==0){
+    const sp=CFG.playerSpeed*G.vel;  // symmetric fwd/rev, as the twin-stick original
+    const nx=G.px+sin(G.heading)*sp*dt, nz=G.pz+cos(G.heading)*sp*dt;
+    let blocked=hitsObstacle(nx,nz,CFG.playerRadius);
+    if(!blocked && G.enemy && G.enemy.type!=="missile" &&
+       dist2(nx,nz,G.enemy.x,G.enemy.z)<(CFG.playerRadius+9)*(CFG.playerRadius+9)) blocked=true;
+    if(blocked){ G.blockedT=1.2; }
+    else { G.px=nx; G.pz=nz; }
+  }
+  sfx.engine(G.vel!==0||G.turn!==0);
+
+  /* --- player firing: one shell at a time --- */
+  if(I.fire && !G.fireLatch && !G.shell){
+    G.shell={x:G.px+sin(G.heading)*10, z:G.pz+cos(G.heading)*10, h:G.heading, dist:0};
+    sfx.fire();
+  }
+  G.fireLatch=I.fire;
+
+  if(G.shell) updateShell(dt);
+  updateEnemy(dt);
+  updateSaucer(dt);
+  updateEnemyShells(dt);
+}
+
+function updateShell(dt){
+  const s=G.shell, mv=CFG.shellSpeed*dt;
+  s.x+=sin(s.h)*mv; s.z+=cos(s.h)*mv; s.dist+=mv;
+  if(s.dist>CFG.shellRange){ G.shell=null; return; }
+  if(hitsObstacle(s.x,s.z,1.5)){ G.shell=null; sfx.thud(); return; }
+  if(G.enemy){
+    const e=G.enemy, r=MODELS[e.type].r;
+    const ey = e.type==="missile" ? (e.y||0) : 0;
+    if(ey<10 && dist2(s.x,s.z,e.x,e.z)<r*r){ G.shell=null; killEnemy(true); return; }
+  }
+  if(G.saucer && dist2(s.x,s.z,G.saucer.x,G.saucer.z)<9*9){
+    explodeAt(G.saucer.x,G.saucer.z,MODELS.saucer,0);
+    addScore(CFG.scores.saucer); G.saucer=null; G.saucerT=20+Math.random()*20;
+    G.shell=null; sfx.explosion(); return;
+  }
+}
+
+function updateEnemy(dt){
+  if(!G.enemy){
+    G.respawnT-=dt;
+    if(G.respawnT<=0) spawnEnemy();
+    return;
+  }
+  const e=G.enemy, p=enemyParams();
+  const toP=Math.atan2(G.px-e.x, G.pz-e.z);
+  const d=Math.sqrt(dist2(e.x,e.z,G.px,G.pz));
+
+  if(e.type==="missile"){
+    /* fast incoming homing missile with lateral zigzag, drops low near player */
+    e.zig+=dt*5.5;
+    e.h=toP;
+    const sp=CFG.missileSpeed*(1+level()*0.12);
+    const lat=cos(e.zig)*CFG.missileZig*Math.min(1,d/120);
+    e.x+=sin(e.h)*sp*dt + sin(e.h+PI/2)*lat*dt;
+    e.z+=cos(e.h)*sp*dt + cos(e.h+PI/2)*lat*dt;
+    e.y=Math.max(0, Math.min(18, (d-60)*0.18));     // glide down on approach
+    sfx.missileWarn(true);
+    if(d<CFG.playerRadius+4 && e.y<4){ G.enemy=null; G.respawnT=CFG.respawnDelay; playerHit(); }
+    return;
+  }
+
+  /* tanks: rotate toward player (with wander), advance, hold range, fire when aligned */
+  const turnRate=(e.type==="supertank"?CFG.superTurn:CFG.tankTurn)*p.speedMul;
+  const want=wrapA(toP-e.h);
+  e.repos-=dt;
+  let target=want;
+  if(e.repos>0) target=want+e.turnDir*0.9;          // occasional flanking arc
+  e.h=wrapA(e.h+Math.max(-turnRate*dt,Math.min(turnRate*dt,target)));
+  const sp=(e.type==="supertank"?CFG.superSpeed:CFG.tankSpeed)*p.speedMul;
+  if(d>110 || e.repos>0){
+    const nx=e.x+sin(e.h)*sp*dt, nz=e.z+cos(e.h)*sp*dt;
+    if(!hitsObstacle(nx,nz,9)){ e.x=nx; e.z=nz; }
+    else { e.turnDir*=-1; e.repos=1.2; }
+  }
+  if(Math.random()<dt*0.12) e.repos=1.0+Math.random()*1.2, e.turnDir=Math.random()<0.5?-1:1;
+
+  e.reload-=dt;
+  if(e.reload<=0 && d<CFG.enemyFireRange && Math.abs(want)<CFG.enemyAimCone+0.02){
+    const err=(Math.random()*2-1)*p.aimErr*Math.max(0.4,d/200);
+    G.eshells.push({x:e.x+sin(e.h)*11, z:e.z+cos(e.h)*11, h:toP+err, dist:0});
+    e.reload=p.reload*(0.8+Math.random()*0.5);
+    sfx.enemyFire();
+  }
+}
+
+function updateSaucer(dt){
+  if(!G.saucer){
+    G.saucerT-=dt;
+    if(G.saucerT<=0 && G.mode==="PLAYING") spawnSaucer();
+    return;
+  }
+  const s=G.saucer;
+  s.turnT-=dt;
+  if(s.turnT<=0){ s.h=Math.random()*TAU; s.turnT=1.5+Math.random()*2.5; }
+  s.x+=sin(s.h)*CFG.saucerSpeed*dt; s.z+=cos(s.h)*CFG.saucerSpeed*dt;
+  s.wob+=dt*3;
+  if(dist2(s.x,s.z,G.px,G.pz)>520*520){ G.saucer=null; G.saucerT=18+Math.random()*18; }
+  sfx.saucerHum(true);
+}
+
+function updateEnemyShells(dt){
+  for(let i=G.eshells.length-1;i>=0;i--){
+    const s=G.eshells[i], mv=CFG.enemyShellSpeed*dt;
+    s.x+=sin(s.h)*mv; s.z+=cos(s.h)*mv; s.dist+=mv;
+    if(s.dist>CFG.shellRange+80 || hitsObstacle(s.x,s.z,1.5)){ G.eshells.splice(i,1); continue; }
+    if(dist2(s.x,s.z,G.px,G.pz)<CFG.playerRadius*CFG.playerRadius){
+      G.eshells.splice(i,1); playerHit(); return;
+    }
+  }
+}
+
+function updateFrags(dt){
+  for(let i=G.frags.length-1;i>=0;i--){
+    const f=G.frags[i];
+    f.t-=dt; if(f.t<=0){G.frags.splice(i,1);continue;}
+    f.x+=f.vx*dt; f.z+=f.vz*dt; f.y+=f.vy*dt; f.vy-=42*dt; f.rot+=f.rv*dt;
+    if(f.y<0){f.y=0;f.vy*=-0.35;f.vx*=0.7;f.vz*=0.7;}
+  }
+}
+
+/* ====================================================================
+   RENDERING (only runs in browser)
+==================================================================== */
+let cv,ctx,W=960,H=720, GREEN="#33ff44", DIM="rgba(51,255,68,0.55)", RED="#ff5533";
+const isBrowser = typeof document!=="undefined" && typeof requestAnimationFrame!=="undefined";
+
+/* ---------------- vector stroke font (original design, 4x6 grid) ---------------- */
+const VFONT={
+A:[[0,6,2,0],[2,0,4,6],[1,4,3,4]],
+B:[[0,0,0,6],[0,0,3,0],[3,0,4,1.5],[4,1.5,3,3],[0,3,3,3],[3,3,4,4.5],[4,4.5,3,6],[3,6,0,6]],
+C:[[4,1,3,0],[3,0,1,0],[1,0,0,1],[0,1,0,5],[0,5,1,6],[1,6,3,6],[3,6,4,5]],
+D:[[0,0,0,6],[0,0,2.5,0],[2.5,0,4,1.5],[4,1.5,4,4.5],[4,4.5,2.5,6],[2.5,6,0,6]],
+E:[[4,0,0,0],[0,0,0,6],[0,6,4,6],[0,3,3,3]],
+F:[[4,0,0,0],[0,0,0,6],[0,3,3,3]],
+G:[[4,1,3,0],[3,0,1,0],[1,0,0,1],[0,1,0,5],[0,5,1,6],[1,6,3,6],[3,6,4,5],[4,5,4,3],[4,3,2,3]],
+H:[[0,0,0,6],[4,0,4,6],[0,3,4,3]],
+I:[[1,0,3,0],[2,0,2,6],[1,6,3,6]],
+J:[[2,0,4,0],[3,0,3,5],[3,5,2,6],[2,6,1,6],[1,6,0,5]],
+K:[[0,0,0,6],[4,0,0,3],[0,3,4,6]],
+L:[[0,0,0,6],[0,6,4,6]],
+M:[[0,6,0,0],[0,0,2,3],[2,3,4,0],[4,0,4,6]],
+N:[[0,6,0,0],[0,0,4,6],[4,6,4,0]],
+O:[[1,0,3,0],[3,0,4,1],[4,1,4,5],[4,5,3,6],[3,6,1,6],[1,6,0,5],[0,5,0,1],[0,1,1,0]],
+P:[[0,6,0,0],[0,0,3,0],[3,0,4,1],[4,1,4,2],[4,2,3,3],[3,3,0,3]],
+Q:[[1,0,3,0],[3,0,4,1],[4,1,4,5],[4,5,3,6],[3,6,1,6],[1,6,0,5],[0,5,0,1],[0,1,1,0],[2.5,4.5,4,6]],
+R:[[0,6,0,0],[0,0,3,0],[3,0,4,1],[4,1,4,2],[4,2,3,3],[3,3,0,3],[1.5,3,4,6]],
+S:[[4,1,3,0],[3,0,1,0],[1,0,0,1],[0,1,0,2],[0,2,1,3],[1,3,3,3],[3,3,4,4],[4,4,4,5],[4,5,3,6],[3,6,1,6],[1,6,0,5]],
+T:[[0,0,4,0],[2,0,2,6]],
+U:[[0,0,0,5],[0,5,1,6],[1,6,3,6],[3,6,4,5],[4,5,4,0]],
+V:[[0,0,2,6],[2,6,4,0]],
+W:[[0,0,1,6],[1,6,2,3],[2,3,3,6],[3,6,4,0]],
+X:[[0,0,4,6],[4,0,0,6]],
+Y:[[0,0,2,3],[4,0,2,3],[2,3,2,6]],
+Z:[[0,0,4,0],[4,0,0,6],[0,6,4,6]],
+"0":[[1,0,3,0],[3,0,4,1],[4,1,4,5],[4,5,3,6],[3,6,1,6],[1,6,0,5],[0,5,0,1],[0,1,1,0],[3.4,0.8,0.6,5.2]],
+"1":[[1,1,2,0],[2,0,2,6],[1,6,3,6]],
+"2":[[0,1,1,0],[1,0,3,0],[3,0,4,1],[4,1,4,2],[4,2,0,6],[0,6,4,6]],
+"3":[[0,0,4,0],[4,0,2,2.5],[2,2.5,4,4],[4,4,4,5],[4,5,3,6],[3,6,1,6],[1,6,0,5]],
+"4":[[3,6,3,0],[3,0,0,4],[0,4,4,4]],
+"5":[[4,0,0,0],[0,0,0,2.5],[0,2.5,3,2.5],[3,2.5,4,3.5],[4,3.5,4,5],[4,5,3,6],[3,6,1,6],[1,6,0,5]],
+"6":[[4,1,3,0],[3,0,1,0],[1,0,0,1],[0,1,0,5],[0,5,1,6],[1,6,3,6],[3,6,4,5],[4,5,4,4],[4,4,3,3],[3,3,0,3]],
+"7":[[0,0,4,0],[4,0,1.5,6]],
+"8":[[1,0,3,0],[3,0,4,1],[4,1,3,3],[3,3,1,3],[1,3,0,1],[0,1,1,0],[1,3,0,4.5],[0,4.5,1,6],[1,6,3,6],[3,6,4,4.5],[4,4.5,3,3]],
+"9":[[0,5,1,6],[1,6,3,6],[3,6,4,5],[4,5,4,1],[4,1,3,0],[3,0,1,0],[1,0,0,1],[0,1,0,2],[0,2,1,3],[1,3,4,3]],
+":":[[2,1.4,2,2.2],[2,4,2,4.8]],
+"/":[[0,6,4,0]],
+".":[[1.8,5.4,2.2,6]],
+"-":[[1,3,3,3]],
+" ":[]
+};
+function vtext(str,x,y,size,align="left"){ // y = baseline
+  const sc=size/6, adv=5.6*sc, s=String(str).toUpperCase();
+  const w=s.length*adv-1.6*sc;
+  let ox= align==="center"? x-w/2 : align==="right"? x-w : x;
+  ctx.beginPath();
+  for(const ch of s){
+    const g=VFONT[ch];
+    if(g)for(const sg of g){
+      ctx.moveTo(ox+sg[0]*sc, y-6*sc+sg[1]*sc);
+      ctx.lineTo(ox+sg[2]*sc, y-6*sc+sg[3]*sc);
+    }
+    ox+=adv;
+  }
+  ctx.stroke();
+}
+
+function project(cx,cy,cz){
+  const k=CFG.fov*H/ (cz);
+  return [W/2 + cx*k, H*0.42 - cy*k];
+}
+function drawSegW(x1,y1,z1,x2,y2,z2){ // world-space segment
+  const a=toCam(x1,y1,z1,G.px,G.pz,G.heading), b=toCam(x2,y2,z2,G.px,G.pz,G.heading);
+  const cl=clipSeg(a,b,CFG.nearZ); if(!cl)return;
+  if(cl[0][2]>CFG.farZ&&cl[1][2]>CFG.farZ)return;
+  const p=project(...cl[0]), q=project(...cl[1]);
+  ctx.moveTo(p[0],p[1]); ctx.lineTo(q[0],q[1]);
+}
+function drawModel(m, x,z,h, yOff=0, scale=1){
+  const s=sin(h),c=cos(h);
+  for(const [i,j] of m.e){
+    const a=m.v[i], b=m.v[j];
+    drawSegW(x+(a[0]*c+a[2]*s)*scale, (a[1]+yOff)*scale, z+(-a[0]*s+a[2]*c)*scale,
+             x+(b[0]*c+b[2]*s)*scale, (b[1]+yOff)*scale, z+(-b[0]*s+b[2]*c)*scale);
+  }
+}
+
+function render(){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,W,H);
+  if(G.shake>0){ctx.translate((Math.random()-0.5)*G.shake,(Math.random()-0.5)*G.shake);G.shake*=0.85;}
+  ctx.lineWidth=Math.max(1.4,H/520); ctx.lineCap="round";
+  ctx.strokeStyle=GREEN; ctx.shadowColor=GREEN; ctx.shadowBlur=H>500?6:0;
+
+  const horizonY=H*0.42;
+
+  /* moon + mountains + volcano (infinitely distant: pan with heading only) */
+  drawSky(horizonY);
+
+  /* horizon line */
+  ctx.beginPath(); ctx.moveTo(0,horizonY); ctx.lineTo(W,horizonY); ctx.stroke();
+
+  /* world wireframes */
+  ctx.beginPath();
+  nearbyObstacles(G.obstacles,G.px,G.pz,CFG.farZ,(wx,wz,o)=>{
+    drawModel(MODELS[o.type],wx,wz,o.rot);
+  });
+  if(G.enemy){
+    const e=G.enemy;
+    drawModel(MODELS[e.type], e.x,e.z,e.h, e.type==="missile"?(e.y||0):0);
+  }
+  if(G.saucer) drawModel(MODELS.saucer,G.saucer.x,G.saucer.z,G.saucer.wob*0.7, sin(G.saucer.wob)*1.2);
+  if(G.shell) drawModel(MODELS.shell,G.shell.x,G.shell.z,G.shell.h);
+  for(const s of G.eshells) drawModel(MODELS.shell,s.x,s.z,s.h);
+  for(const f of G.frags){
+    drawSegW(f.x+cos(f.rot)*3,f.y,f.z+sin(f.rot)*3, f.x-cos(f.rot)*3,f.y+1.3,f.z-sin(f.rot)*3);
+  }
+  ctx.stroke();
+
+  if(G.mode==="PLAYING"||G.mode==="DYING") drawHUD(horizonY);
+  drawTitles();
+
+  if(G.deathFlash>0){
+    ctx.fillStyle=`rgba(160,255,160,${G.deathFlash*0.55})`; ctx.fillRect(0,0,W,H);
+  }
+  if(G.mode==="DYING"){
+    if(!G.cracks)G.cracks=makeCracks(W,H);
+    ctx.strokeStyle=GREEN; ctx.beginPath();
+    for(const line of G.cracks){ctx.moveTo(line[0][0],line[0][1]);
+      for(const p of line)ctx.lineTo(p[0],p[1]);}
+    ctx.stroke();
+  }
+  ctx.shadowBlur=0;
+}
+
+function skyX(rel){ // identical projection to a world point at infinity
+  return W/2 + Math.tan(rel)*CFG.fov*H;
+}
+function drawSky(horizonY){
+  const span=1.25;                       // cull beyond ~72° off-axis
+  const {pts,N,volcanoIdx}=G.horizon;
+  ctx.beginPath();
+  let started=false;
+  for(let i=-1;i<=N;i++){
+    const idx=((i%N)+N)%N;
+    const worldA=idx/N*TAU;
+    let rel=wrapA(worldA-G.heading);
+    if(Math.abs(rel)>span){started=false;continue;}
+    const sx=skyX(rel);
+    if(sx<-120||sx>W+120){started=false;continue;}
+    const sy=horizonY - pts[idx]*(H/360);
+    if(!started){ctx.moveTo(sx,sy);started=true;} else ctx.lineTo(sx,sy);
+  }
+  ctx.stroke();
+  /* erupting volcano particles */
+  const va=volcanoIdx/G.horizon.N*TAU;
+  const rel=wrapA(va-G.heading);
+  if(Math.abs(rel)<span){
+    const vx=skyX(rel), vy=horizonY-43*(H/360);
+    ctx.beginPath();
+    for(let i=0;i<7;i++){
+      const t=(G.time*1.3+i*0.41)%1, a=(i*2.39)%1-0.5;
+      const px=vx+a*46*t, py=vy- (t*34-(t*t)*26)*(H/360)*1.6;
+      if(py<vy+4){ctx.moveTo(px,py);ctx.lineTo(px+2,py-2);}
+    }
+    ctx.stroke();
+  }
+  /* crescent moon */
+  const ma=wrapA(2.4-G.heading);
+  if(Math.abs(ma)<span){
+    const mx=skyX(ma), my=horizonY-H*0.21, r=H*0.028;
+    ctx.beginPath(); ctx.arc(mx,my,r,PI*0.42,PI*1.58,false);
+    ctx.arc(mx+r*0.55,my,r*0.78,PI*1.5,PI*0.5,true);
+    ctx.stroke();
+  }
+}
+
+function drawHUD(horizonY){
+  const u=H/720; // ui scale
+  /* reticle — below the red overlay band on the original cabinet, so GREEN */
+  ctx.strokeStyle=GREEN; ctx.shadowColor=GREEN;
+  ctx.beginPath();
+  const cx=W/2, cy=horizonY+H*0.06, g=26*u;
+  ctx.moveTo(cx,cy-58*u);ctx.lineTo(cx,cy-g);
+  ctx.moveTo(cx,cy+g);ctx.lineTo(cx,cy+58*u);
+  ctx.moveTo(cx-46*u,cy-g);ctx.lineTo(cx-12*u,cy-g);ctx.lineTo(cx-12*u,cy-g+12*u);
+  ctx.moveTo(cx+46*u,cy-g);ctx.lineTo(cx+12*u,cy-g);ctx.lineTo(cx+12*u,cy-g+12*u);
+  ctx.moveTo(cx-46*u,cy+g);ctx.lineTo(cx-12*u,cy+g);ctx.lineTo(cx-12*u,cy+g-12*u);
+  ctx.moveTo(cx+46*u,cy+g);ctx.lineTo(cx+12*u,cy+g);ctx.lineTo(cx+12*u,cy+g-12*u);
+  ctx.stroke();
+
+  /* radar — top band sat under the cabinet's RED overlay */
+  ctx.strokeStyle=RED; ctx.shadowColor=RED;
+  const rr=H*0.085, rx=W/2, ry=rr+14*u;
+  ctx.beginPath(); ctx.arc(rx,ry,rr,0,TAU);
+  ctx.moveTo(rx-rr*1.25,ry);ctx.lineTo(rx-rr*1.02,ry);
+  ctx.moveTo(rx+rr*1.25,ry);ctx.lineTo(rx+rr*1.02,ry);
+  ctx.moveTo(rx,ry-rr*1.25);ctx.lineTo(rx,ry-rr*1.02);
+  ctx.moveTo(rx,ry); ctx.lineTo(rx+sin(G.sweep)*rr, ry-cos(G.sweep)*rr); // sweep
+  ctx.stroke();
+  /* enemy blip (saucer deliberately not shown — matches the original) */
+  if(G.enemy){
+    const dx=G.enemy.x-G.px, dz=G.enemy.z-G.pz;
+    const d=Math.sqrt(dx*dx+dz*dz);
+    if(d<CFG.radarRange){
+      const a=wrapA(Math.atan2(dx,dz)-G.heading), rd=d/CFG.radarRange*rr;
+      ctx.fillStyle=RED;
+      ctx.fillRect(rx+sin(a)*rd-2.4*u, ry-cos(a)*rd-2.4*u, 4.8*u,4.8*u);
+    }
+  }
+
+  /* score / hiscore / lives — vector stroke text */
+  vtext("SCORE "+G.score, 18*u, 34*u, 18*u);
+  vtext("HIGH "+G.hiscore, 18*u, 60*u, 18*u);
+  vtext("LIVES", W-18*u, 34*u, 18*u, "right");
+  for(let i=0;i<G.lives;i++){ // little tank glyphs
+    const tx=W-30*u-i*34*u, ty=48*u;
+    ctx.strokeRect(tx-11*u,ty,22*u,8*u);
+    ctx.strokeRect(tx-5*u,ty-6*u,10*u,6*u);
+    ctx.beginPath();ctx.moveTo(tx+5*u,ty-3*u);ctx.lineTo(tx+15*u,ty-3*u);ctx.stroke();
+  }
+
+  /* status messages */
+  let msg=null;
+  if(G.blockedT>0) msg="MOTION BLOCKED BY OBJECT";
+  else if(G.enemy){
+    const a=wrapA(Math.atan2(G.enemy.x-G.px,G.enemy.z-G.pz)-G.heading);
+    const d=Math.sqrt(dist2(G.enemy.x,G.enemy.z,G.px,G.pz));
+    if(Math.abs(a)<0.28 && d<CFG.enemyFireRange) msg="ENEMY IN RANGE";
+    else if(a<-0.28) msg="ENEMY TO LEFT";
+    else if(a>0.28) msg="ENEMY TO RIGHT";
+  }
+  if(msg && Math.floor(G.time*2.4)%2===0)
+    vtext(msg, W/2, ry+rr+34*u, 16*u, "center");
+}
+
+function drawTitles(){
+  const u=H/720;
+  ctx.strokeStyle=GREEN; ctx.shadowColor=GREEN;
+  if(G.mode==="ATTRACT"){
+    vtext("BATTLE ZONE", W/2, H*0.30, 62*u, "center");
+    vtext("A WIREFRAME TANK COMBAT TRIBUTE", W/2, H*0.37, 15*u, "center");
+    if(Math.floor(G.time*1.6)%2===0)
+      vtext("PRESS ENTER OR TAP TO START", W/2, H*0.55, 20*u, "center");
+    vtext("MOVE: W/S OR ARROWS   PIVOT: A/D   FIRE: SPACE / CLICK", W/2, H*0.86, 12*u, "center");
+    vtext("TANK 1000   MISSILE 2000   SUPERTANK 3000   SAUCER 5000", W/2, H*0.91, 12*u, "center");
+  }
+  if(G.mode==="GAMEOVER"){
+    vtext("GAME OVER", W/2, H*0.56, 56*u, "center");
+    vtext("SCORE "+G.score, W/2, H*0.64, 20*u, "center");
+    if(Math.floor(G.time*1.6)%2===0)
+      vtext("PRESS ENTER OR TAP TO PLAY AGAIN", W/2, H*0.73, 18*u, "center");
+  }
+}
+
+/* ====================================================================
+   AUDIO — tiny WebAudio synth (browser only)
+==================================================================== */
+const sfx=(()=> {
+  if(!isBrowser) return new Proxy({},{get:()=>()=>{}});
+  let ac=null, engOsc=null, engGain=null, missOsc=null, missGain=null, saucOsc=null, saucGain=null;
+  let missOn=0, saucOn=0;
+  const A=()=>{ if(!ac){ac=new (window.AudioContext||window.webkitAudioContext)();} 
+    if(ac.state==="suspended")ac.resume(); return ac; };
+  function noise(dur,fc,vol,drop){
+    const a=A(), b=a.createBuffer(1,a.sampleRate*dur,a.sampleRate), d=b.getChannelData(0);
+    for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*(1-i/d.length);
+    const src=a.createBufferSource();src.buffer=b;
+    const f=a.createBiquadFilter();f.type="lowpass";f.frequency.value=fc;
+    if(drop)f.frequency.exponentialRampToValueAtTime(Math.max(60,fc*0.1),a.currentTime+dur);
+    const g=a.createGain();g.gain.value=vol;g.gain.exponentialRampToValueAtTime(0.001,a.currentTime+dur);
+    src.connect(f);f.connect(g);g.connect(a.destination);src.start();
+  }
+  function beepSweep(f0,f1,dur,vol,type="square"){
+    const a=A(),o=a.createOscillator(),g=a.createGain();
+    o.type=type;o.frequency.setValueAtTime(f0,a.currentTime);
+    o.frequency.exponentialRampToValueAtTime(Math.max(30,f1),a.currentTime+dur);
+    g.gain.value=vol;g.gain.exponentialRampToValueAtTime(0.001,a.currentTime+dur);
+    o.connect(g);g.connect(a.destination);o.start();o.stop(a.currentTime+dur);
+  }
+  return {
+    unlock(){A();},
+    startEngine(){ const a=A(); this.stopEngine();
+      engOsc=a.createOscillator();engOsc.type="sawtooth";engOsc.frequency.value=42;
+      engGain=a.createGain();engGain.gain.value=0.03;
+      const f=a.createBiquadFilter();f.type="lowpass";f.frequency.value=130;
+      engOsc.connect(f);f.connect(engGain);engGain.connect(a.destination);engOsc.start(); },
+    stopEngine(){ if(engOsc){try{engOsc.stop()}catch(e){}engOsc=null;}
+      if(missOsc){try{missOsc.stop()}catch(e){}missOsc=null;}
+      if(saucOsc){try{saucOsc.stop()}catch(e){}saucOsc=null;} },
+    engine(moving){ if(engOsc){engOsc.frequency.value=moving?58:42;
+      engGain.gain.value=moving?0.045:0.028;} },
+    fire(){ noise(0.22,2400,0.5,true); beepSweep(620,140,0.18,0.12); },
+    enemyFire(){ noise(0.2,1500,0.3,true); },
+    thud(){ noise(0.12,500,0.3,true); },
+    explosion(){ noise(0.8,900,0.7,true); beepSweep(220,40,0.7,0.15,"sawtooth"); },
+    playerDeath(){ noise(1.4,1100,0.8,true); beepSweep(300,30,1.2,0.2,"sawtooth"); this.missileWarn(false); },
+    bonus(){ beepSweep(520,1040,0.12,0.18); setTimeout(()=>beepSweep(660,1320,0.14,0.18),130); },
+    missileWarn(on){
+      const a=A();
+      if(on&&!missOsc){ missOsc=a.createOscillator();missOsc.type="square";
+        missGain=a.createGain();missGain.gain.value=0.05;
+        missOsc.connect(missGain);missGain.connect(a.destination);missOsc.start(); }
+      if(on&&missOsc){ missOsc.frequency.value=700+sin(G.time*22)*250; missOn=G.time; }
+      if(!on&&missOsc){ try{missOsc.stop()}catch(e){} missOsc=null; }
+    },
+    saucerHum(on){
+      const a=A();
+      if(on&&!saucOsc){ saucOsc=a.createOscillator();saucOsc.type="triangle";
+        saucGain=a.createGain();saucGain.gain.value=0.035;
+        saucOsc.connect(saucGain);saucGain.connect(a.destination);saucOsc.start(); }
+      if(on&&saucOsc){ saucOsc.frequency.value=300+sin(G.time*7)*60; saucOn=G.time; }
+    },
+    tick(){ // auto-silence loops when their sources vanish
+      if(missOsc && (!G.enemy||G.enemy.type!=="missile")){try{missOsc.stop()}catch(e){}missOsc=null;}
+      if(saucOsc && !G.saucer){try{saucOsc.stop()}catch(e){}saucOsc=null;}
+    }
+  };
+})();
+
+/* ====================================================================
+   INPUT + MAIN LOOP (browser only)
+==================================================================== */
+if(isBrowser){
+  cv=document.getElementById("c");ctx=cv.getContext("2d");
+  function resize(){
+    const dpr=Math.min(window.devicePixelRatio||1,2);
+    W=cv.width=Math.floor(innerWidth*dpr); H=cv.height=Math.floor(innerHeight*dpr);
+    cv.style.width=innerWidth+"px";cv.style.height=innerHeight+"px";
+    G.cracks=null;
+  }
+  addEventListener("resize",resize);resize();
+
+  const KEY={ArrowUp:"f",KeyW:"f",ArrowDown:"b",KeyS:"b",
+             ArrowLeft:"l",KeyA:"l",ArrowRight:"r",KeyD:"r",Space:"fire"};
+  addEventListener("keydown",e=>{
+    sfx.unlock();
+    if(e.code==="Enter"&&G.mode!=="PLAYING"&&G.mode!=="DYING"){newGame();return;}
+    const k=KEY[e.code]; if(k){G.input[k]=true;e.preventDefault();}
+  });
+  addEventListener("keyup",e=>{const k=KEY[e.code];if(k)G.input[k]=false;});
+  cv.addEventListener("pointerdown",e=>{
+    sfx.unlock();
+    if(G.mode!=="PLAYING"&&G.mode!=="DYING"){newGame();return;}
+    G.input.fire=true;
+  });
+  cv.addEventListener("pointerup",()=>{G.input.fire=false;});
+  // touch buttons
+  for(const [id,k] of [["bl","l"],["br","r"],["bf","f"],["bb","b"],["bfire","fire"]]){
+    const el=document.getElementById(id);
+    el.addEventListener("pointerdown",e=>{e.preventDefault();sfx.unlock();
+      if(G.mode!=="PLAYING"&&G.mode!=="DYING"){newGame();return;} G.input[k]=true;});
+    el.addEventListener("pointerup",e=>{e.preventDefault();G.input[k]=false;});
+    el.addEventListener("pointerleave",()=>{G.input[k]=false;});
+  }
+
+  let last=performance.now();
+  function loop(now){
+    const dt=Math.min(0.05,(now-last)/1000); last=now;
+    step(dt); sfx.tick(); render();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+}
+
+/* ---- test hooks (headless) ---- */
+if(typeof module!=="undefined") module.exports={G,CFG,MODELS,step,newGame,spawnEnemy,
+  spawnSaucer,hitsObstacle,toCam,clipSeg,wrapA,enemyParams,level,addScore,playerHit,
+  makeObstacles,nearbyObstacles,killEnemy,render,makeCracks,VFONT};
+if(typeof window!=="undefined") window.BZ={G,CFG,step,newGame};
+</script>
+</body>
+</html>
